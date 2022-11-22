@@ -8,7 +8,7 @@ from torch.nn import functional as F
 from torch.distributions import Categorical
 from typing import List, Optional, Tuple, Union
 from whisper.audio import SAMPLE_RATE, N_FRAMES, HOP_LENGTH, pad_or_trim, log_mel_spectrogram
-from whisper.decoding import DecodingOptions, DecodingResult
+from whisper.decoding import DecodingOptions
 from whisper.tokenizer import LANGUAGES
 from whisper.utils import exact_div, format_timestamp, compression_ratio
 from whisper.model import Whisper
@@ -19,8 +19,30 @@ from itertools import chain, repeat
 from copy import deepcopy
 import os
 import json
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional, Union
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+from torch.distributions import Categorical
 
 MIN_DUR = 0.02
+
+
+@dataclass(frozen=True)
+class DecodingResult:
+    audio_features: Tensor
+    language: str
+    probs: List[float] = None
+    text: str = ""
+    avg_logprob: float = np.nan
+    no_speech_prob: float = np.nan
+    temperature: float = np.nan
+    compression_ratio: float = np.nan
+    language_probs: Optional[Dict[str, float]] = None
+    tokens: List[int] = field(default_factory=list)
 
 
 # no_caption changed to no_speech newer commits
@@ -314,7 +336,7 @@ def results_to_sentence_word_ass(res: (dict, list), ass_path: str,
      -using segment-level timestamps display phrases as usual
      -using word-level timestamps change formats (e.g. color/underline) of the word in the displayed segment
     
-    Note: ass file is used in the same way as srt, vtt, etc. 
+    Note: ass file is used in the same way as srt, vtt, etc.
 
     Parameters
     ----------
@@ -542,7 +564,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     
     if not ass_path.endswith('.ass'):
         ass_path += '.ass'
-        
+
     with open(ass_path, 'w') as f:
         f.write(ass_str)
 
@@ -874,14 +896,19 @@ def add_whole_word_ts(tokenizer: Tokenizer, segments: Union[List[dict], dict], m
                     prev_idx = wts_idx
                     remaining_text = remaining_text[len(temp_whole_word):]
                     if ((not merge_non_space or temp_whole_word.startswith(' ') or not whole_word_timestamps) and
-                            temp_whole_word not in append_punctuations and
-                            not has_prepend) or not len(whole_word_timestamps):
+                        temp_whole_word not in append_punctuations and
+                        not has_prepend) or not len(whole_word_timestamps):
                         has_prepend = temp_whole_word.strip() in prepend_punctuations
-                        whole_word_timestamps.append(dict(word=temp_whole_word, timestamp=max_ts))
+                        whole_word_timestamps.append(dict(
+                            word=temp_whole_word,
+                            timestamp=max_ts,
+                            confidence=seg["probs"][wts_idx]
+                        ))
                     else:
                         has_prepend = False
                         whole_word_timestamps[-1]['word'] += temp_whole_word
                         whole_word_timestamps[-1]['timestamp'] = max_ts
+                        whole_word_timestamps[-1]['confidence'] = seg["probs"][wts_idx]
             if remaining_text:
                 failed_idx.append(seg_idx)
                 whole_word_timestamps = []
@@ -1244,6 +1271,7 @@ def transcribe_word_level(
                 "end": end,
                 "text": text,
                 "tokens": result.tokens,
+                "probs": result.probs,
                 "temperature": result.temperature,
                 "avg_logprob": result.avg_logprob,
                 "compression_ratio": result.compression_ratio,
@@ -1617,7 +1645,8 @@ class DecodingTaskWordLevel(DecodingTask):
         n_batch = tokens.shape[0]
         sum_logprobs: Tensor = torch.zeros(n_batch, device=audio_features.device)
         no_speech_probs = [np.nan] * n_batch
-
+        old_sum_logprobs: Tensor = torch.zeros(n_batch, device=audio_features.device)
+        logprobs: Tensor = torch.Tensor(torch.Tensor())
         try:
             for i in range(self.sample_len):
                 if self.alpha:
@@ -1644,13 +1673,15 @@ class DecodingTaskWordLevel(DecodingTask):
 
                 # expand the tokens tensor with the selected next tokens
                 tokens, completed = self.decoder.update_with_ts(tokens, logits, sum_logprobs, ts)
+                logprobs = torch.cat((logprobs, sum_logprobs - old_sum_logprobs), dim=-1)
+                old_sum_logprobs = sum_logprobs.detach().clone()
 
                 if completed or tokens.shape[-1] > self.n_ctx:
                     break
         finally:
             self.inference.cleanup_caching()
 
-        return tokens, sum_logprobs, no_speech_probs
+        return tokens, sum_logprobs, no_speech_probs, logprobs
 
     # modified version of whisper.DecodingTask.run
     @torch.no_grad()
@@ -1676,20 +1707,23 @@ class DecodingTaskWordLevel(DecodingTask):
         tokens = tokens.repeat_interleave(self.n_group, dim=0).to(audio_features.device)
 
         # call the main sampling loop
-        tokens, sum_logprobs, no_speech_probs = self._main_loop(audio_features, tokens)
-
+        tokens, sum_logprobs, no_speech_probs, _logprobs = self._main_loop(audio_features, tokens)
         # reshape the tensors to have (n_audio, n_group) as the first two dimensions
         audio_features = audio_features[:: self.n_group]
         no_speech_probs = no_speech_probs[:: self.n_group]
         assert audio_features.shape[0] == len(no_speech_probs) == n_audio
 
         tokens = tokens.reshape(n_audio, self.n_group, -1)
+        _logprobs = _logprobs.reshape(n_audio, self.n_group, -1)
         sum_logprobs = sum_logprobs.reshape(n_audio, self.n_group)
 
         # get the final candidates for each group, and slice between the first sampled token and EOT
         tokens, sum_logprobs, ts = self.decoder.finalize(tokens, sum_logprobs)
         tokens: List[List[Tensor]] = [
             [t[self.sample_begin: (t == tokenizer.eot).nonzero()[0, 0]] for t in s] for s in tokens
+        ]
+        _logprobs: List[List[Tensor]] = [
+            [_logprobs[i][j][:len(tokens[i][j])] for j in range(len(tokens[i]))] for i in range(len(_logprobs))
         ]
         ts: List[List[Tensor]] = [[t[:, :tokens[i][j].shape[-1]] for j, t in enumerate(s)] for i, s in enumerate(ts)]
 
@@ -1698,11 +1732,14 @@ class DecodingTaskWordLevel(DecodingTask):
         tokens: List[List[int]] = [t[i].tolist() for i, t in zip(selected, tokens)]
         ts: List[List[int]] = [t[i].tolist() for i, t in zip(selected, ts)]
         texts: List[str] = [tokenizer.decode(t).strip() for t in tokens]
+        probs = [[np.exp(_logprobs[i][j]) for j in range(len(_logprobs[i]))] for i in range(len(_logprobs))]
+        probs = probs[0]
+        # texts = [[tokenizer.decode(t[i]) for i in range(len(t))] for t in tokens]
 
         sum_logprobs: List[float] = [lp[i] for i, lp in zip(selected, sum_logprobs)]
         avg_logprobs: List[float] = [lp / (len(t) + 1) for t, lp in zip(tokens, sum_logprobs)]
 
-        fields = (texts, languages, tokens, audio_features, avg_logprobs, no_speech_probs)
+        fields = (texts, languages, tokens, probs, audio_features, avg_logprobs, no_speech_probs)
         if len(set(map(len, fields))) != 1:
             raise RuntimeError(f"inconsistent result lengths: {list(map(len, fields))}")
 
@@ -1711,6 +1748,7 @@ class DecodingTaskWordLevel(DecodingTask):
                        audio_features=features,
                        language=language,
                        tokens=tokens,
+                       probs=probs.detach().numpy().tolist(),
                        text=text,
                        avg_logprob=avg_logprob,
                        **(dict(no_caption_prob=no_speech_prob) if hasattr(DecodingResult, 'no_caption_prob') else dict(
@@ -1718,7 +1756,7 @@ class DecodingTaskWordLevel(DecodingTask):
                        temperature=self.options.temperature,
                        compression_ratio=compression_ratio(text),
                    )
-                   for text, language, tokens, features, avg_logprob, no_speech_prob in zip(*fields)
+                   for text, language, tokens, probs, features, avg_logprob, no_speech_prob in zip(*fields)
                ], ts
 
 
