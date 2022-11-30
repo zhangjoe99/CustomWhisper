@@ -1,4 +1,5 @@
 from lhotse import CutSet, RecordingSet, align_with_torchaudio, annotate_with_whisper, MonoCut
+from pydub import AudioSegment
 from tqdm import tqdm
 
 
@@ -16,7 +17,11 @@ def convert_cut(cut: MonoCut):
     return results
 
 
-recordings = RecordingSet.from_dir("./", pattern="audio.mp3")
+sound = AudioSegment.from_mp3("audio.mp3")
+sound = sound.set_channels(1)
+sound.export("audio.wav", format="wav")
+
+recordings = RecordingSet.from_dir("./", pattern="audio.wav")
 
 cuts = list(annotate_with_whisper(recordings))
 cuts_aligned = align_with_torchaudio(cuts)
