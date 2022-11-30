@@ -22,7 +22,7 @@ while i < total_segments:
     t1 = i # segment start time
     t2 = i + 5 # segment end time
     # keep start time 0 and iterate end time by 1s until 5s reached
-    if (k <= 5):
+    if (k < 5):
         t2 = k
         k += 1
         i = 0
