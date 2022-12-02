@@ -12,23 +12,17 @@ process = subprocess.Popen(get_duration_cmd, stdout=subprocess.PIPE, stderr=subp
 # collect output
 out, err = process.communicate()
 
-# video length (s)
 length = math.floor(float(out))
+times = []
+for i in range(min(length,5)):
+  times.append([0,i+1])
 
-# iterate through segments
-i = 0 # while loop counter
-k = 1 # counter for first sub-5s segments
-while k <= length:
-    t1 = i # segment start time
-    t2 = i + 5 # segment end time
-    # keep start time 0 and iterate end time by 1s until 5s reached
-    if (k < 5):
-        t2 = k
-        k += 1
-    else: # afterwards begin iterating start time by 1s
-        i += 1
-        k += 1
 
+if length >5:
+  for i in range(1,length-5+1):
+    times.append([i,i+5])
+
+for t1,t2 in times:
     # format out_file name for each clip, based on start/end times
     seg_file_name = out_file.replace('.mkv', '{}-{}.mkv'.format(t1, t2))
     # build split_video bash cmd: change -n to -y to automatically overwrite existing files
