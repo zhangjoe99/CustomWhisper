@@ -16,46 +16,62 @@ def main(argv):
   # get passed in arguments 
   args = argument_handler()
 
-  in_file = args.filename
-  out_file = "clip_" + in_file
+  overwrite = '-n'
+  if (args.over_write):
+    overwrite = '-y'
 
+  in_file = args.filename
+
+  # make copy of in_file with forced keyframes every ~1s (assuming in_file is 30fps)
+  forced_keyframe_file = in_file.replace('.', '_forced_key_frames.')
+  print('making temporary working copy of {} with ~1s forced key frames...'.format(in_file))
+  # build bash cmd
+  split_video_cmd = ['ffmpeg', '-i', in_file, '-g', '30', overwrite, forced_keyframe_file]
+  # excecute cmd
+  process = subprocess.Popen(split_video_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+  # collect, print cmd output
+  out, err = process.communicate()
+  #print('CMD OUTPUT:\n{}\nCMD ERROR:\n{}\n'.format(out, err))
+
+  ## note: print key frames of file with cmd: ffprobe -loglevel error -select_streams v:0 -show_entries packet=pts_time,flags -of csv=print_section=0 example-video_forced_key_frames.mkv | awk -F',' '/K/ {print $1}'
+
+  print('splitting {} into 5s interval clips...'.format(in_file))
+  
   # get duration of in_file
   get_duration_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', in_file]
-  
-  # build bash cmd
   process = subprocess.Popen(get_duration_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-  # collect cmd output
   out, err = process.communicate()
+  length = math.floor(float(out)) # length (s) of in_file
+ 
+  # iterate through clips
+  i = 0 # clip start counter
+  k = 0 # loop counter (also clip end counter)
+  while k < 10:
+    # keep start time 0 and iterate end time by 1s until 5s reached
+    if (k < 5):
+        k += 1
+    else: # afterwards begin iterating both start/end times by 1s
+        i += 1
+        k += 1
 
-  length = math.floor(float(out))
-  
-  times = []
-  for i in range(min(length,5)):
-    times.append([0,i+1])
+    # format output name of clip, based on start/end times
+    clip_file_name = forced_keyframe_file.replace('.', 'clip_{}-{}.'.format(i, k))
 
-  if length >5:
-    for i in range(1,length-5+1):
-      times.append([i,i+5])
+    # build split_video bash cmd
+    split_video_cmd = ['ffmpeg', '-i', forced_keyframe_file, '-ss', str(i), '-to', str(k), overwrite, clip_file_name]
+    # resulting cmd: ffmpeg [in_file] -ss [i] -to [k] -c copy -[y/n] clip_file_name
 
-  for t1,t2 in times:
-      # format out_file name for each clip, based on start/end times
-      seg_file_name = out_file.replace('clip_', 'clip_{}-{}_'.format(t1, t2))
-      
-      # build split_video bash cmd: change -n to -y to automatically overwrite existing files
-      split_video_cmd = None
-      if (args.over_write):
-        split_video_cmd = ['ffmpeg', '-y', '-ss', str(t1), '-i', in_file, '-c', 'copy', '-t', str(t2), seg_file_name]
-        # resulting cmd: ffmpeg -y -ss t1 -i in_file -c copy -t t2 seg_file_name
-      else:
-        split_video_cmd = ['ffmpeg', '-n', '-ss', str(t1), '-i', in_file, '-c', 'copy', '-t', str(t2), seg_file_name]
-        # resulting cmd: ffmpeg -n -ss t1 -i in_file -c copy -t t2 seg_file_name
-      
-      # run cmd
-      proc = subprocess.Popen(split_video_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-      
-      # collect output
-      out, err = proc.communicate()
-      print('CMD OUTPUT:\n{}\nCMD ERROR:\n{}\n'.format(out, err))
+    # run cmd
+    proc = subprocess.Popen(split_video_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    # collect, print output
+    out, err = proc.communicate()
+    #print('CMD OUTPUT:\n{}\nCMD ERROR:\n{}\n'.format(out, err))
+
+  print('removing temporary working file: {}'.format(forced_keyframe_file))
+  remove_fkf_file = ['rm', forced_keyframe_file]
+  proc = subprocess.Popen(remove_fkf_file, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+  out, err = proc.communicate()
+  #print('CMD OUTPUT:\n{}\nCMD ERROR:\n{}\n'.format(out, err))
 
 # so main() isn't executed if file is imported
 if __name__ == "__main__":
