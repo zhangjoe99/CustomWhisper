@@ -46,7 +46,7 @@ def main(argv):
   # iterate through clips
   i = 0 # clip start counter
   k = 0 # loop counter (also clip end counter)
-  while k < 10:
+  while k < length:
     # keep start time 0 and iterate end time by 1s until 5s reached
     if (k < 5):
         k += 1
